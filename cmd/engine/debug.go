@@ -21,6 +21,8 @@ import (
 	"golang.org/x/exp/constraints"
 	"golang.org/x/net/trace"
 	"golang.org/x/sys/unix"
+
+	"github.com/dagger/dagger/engine/server"
 )
 
 func setupDebugHandlers(addr string) error {
@@ -35,6 +37,7 @@ func setupDebugHandlers(addr string) error {
 	m.Handle("/debug/pprof/goroutine", pprof.Handler("goroutine"))
 	m.Handle("/debug/requests", http.HandlerFunc(trace.Traces))
 	m.Handle("/debug/events", http.HandlerFunc(trace.Events))
+	// m.Handle("/debug/fgtrace", fgtrace.Config{})
 
 	m.Handle("/debug/gc", http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		runtime.GC()
@@ -51,7 +54,7 @@ func setupDebugHandlers(addr string) error {
 		return err
 	}
 	logrus.Debugf("debug handlers listening at %s", addr)
-	go http.Serve(l, m) // nolint:gosec
+	go http.Serve(l, m) //nolint:gosec
 	return nil
 }
 
@@ -80,9 +83,12 @@ func logTraceMetrics(ctx context.Context) {
 	}
 }
 
-func logMetrics(ctx context.Context, engineStateRootDir string) {
+func logMetrics(ctx context.Context, engineStateRootDir string, eng *server.Server) {
 	for range time.Tick(60 * time.Second) {
 		l := bklog.G(ctx)
+
+		// controller stats
+		l = eng.LogMetrics(l)
 
 		// goroutine stats
 		l = l.WithField("goroutine-count", runtime.NumGoroutine())

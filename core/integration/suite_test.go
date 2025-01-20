@@ -2,6 +2,7 @@ package core
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"crypto/md5"
 	"errors"
@@ -9,41 +10,79 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"strings"
+	"runtime"
+	"sync"
 	"testing"
+	"time"
 
-	"dagger.io/dagger"
-	"github.com/dagger/dagger/core"
-	"github.com/dagger/dagger/internal/testutil"
 	"github.com/moby/buildkit/identity"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/errgroup"
+
+	"dagger.io/dagger"
+	"dagger.io/dagger/telemetry"
+	"github.com/dagger/dagger/core"
+	"github.com/dagger/dagger/internal/testutil"
+	"github.com/dagger/dagger/testctx"
 )
 
+var testCtx = context.Background()
+
 func TestMain(m *testing.M) {
-	os.Setenv("_DAGGER_DEBUG_HEALTHCHECKS", "1")
-	// start with fresh test registries once per suite; they're an engine-global
-	// dependency
-	// startRegistry()
-	// startPrivateRegistry()
-	os.Exit(m.Run())
+	// Preserve original SSH_AUTH_SOCK value and
+	// Ensure SSH_AUTH_SOCK does not pollute tests state
+	origAuthSock := os.Getenv("SSH_AUTH_SOCK")
+	os.Unsetenv("SSH_AUTH_SOCK")
+
+	testCtx = telemetry.InitEmbedded(testCtx, nil)
+	res := m.Run()
+	telemetry.Close()
+
+	if origAuthSock != "" {
+		os.Setenv("SSH_AUTH_SOCK", origAuthSock)
+	}
+	os.Exit(res)
 }
 
-func connect(t require.TestingT) (*dagger.Client, context.Context) {
-	ctx := context.Background()
-	client, err := dagger.Connect(ctx, dagger.WithLogOutput(os.Stderr))
+const InstrumentationLibrary = "dagger.io/integration"
+
+func Tracer() trace.Tracer {
+	return otel.Tracer(InstrumentationLibrary)
+}
+
+func Logger() log.Logger {
+	return telemetry.Logger(testCtx, InstrumentationLibrary)
+}
+
+func Middleware() []testctx.Middleware {
+	return []testctx.Middleware{
+		testctx.WithParallel,
+		testctx.WithOTelLogging(Logger()),
+		testctx.WithOTelTracing(Tracer()),
+	}
+}
+
+func connect(ctx context.Context, t *testctx.T, opts ...dagger.ClientOpt) *dagger.Client {
+	opts = append([]dagger.ClientOpt{
+		dagger.WithLogOutput(testutil.NewTWriter(t.T)),
+	}, opts...)
+	client, err := dagger.Connect(ctx, opts...)
 	require.NoError(t, err)
-	return client, ctx
+	t.Cleanup(func() { client.Close() })
+	return client
 }
 
-func newCache(t *testing.T) core.CacheID {
+func newCache(t *testctx.T) core.CacheVolumeID {
 	var res struct {
 		CacheVolume struct {
-			ID core.CacheID
+			ID core.CacheVolumeID
 		}
 	}
 
-	err := testutil.Query(`
+	err := testutil.Query(t, `
 		query CreateCache($key: String!) {
 			cacheVolume(key: $key) {
 				id
@@ -57,7 +96,7 @@ func newCache(t *testing.T) core.CacheID {
 	return res.CacheVolume.ID
 }
 
-func newDirWithFile(t *testing.T, path, contents string) core.DirectoryID {
+func newDirWithFile(t *testctx.T, path, contents string) core.DirectoryID {
 	dirRes := struct {
 		Directory struct {
 			WithNewFile struct {
@@ -66,7 +105,7 @@ func newDirWithFile(t *testing.T, path, contents string) core.DirectoryID {
 		}
 	}{}
 
-	err := testutil.Query(
+	err := testutil.Query(t,
 		`query Test($path: String!, $contents: String!) {
 			directory {
 				withNewFile(path: $path, contents: $contents) {
@@ -82,42 +121,7 @@ func newDirWithFile(t *testing.T, path, contents string) core.DirectoryID {
 	return dirRes.Directory.WithNewFile.ID
 }
 
-func newSecret(t *testing.T, content string) core.SecretID {
-	var secretRes struct {
-		Directory struct {
-			WithNewFile struct {
-				File struct {
-					Secret struct {
-						ID core.SecretID
-					}
-				}
-			}
-		}
-	}
-
-	err := testutil.Query(
-		`query Test($content: String!) {
-			directory {
-				withNewFile(path: "some-file", contents: $content) {
-					file(path: "some-file") {
-						secret {
-							id
-						}
-					}
-				}
-			}
-		}`, &secretRes, &testutil.QueryOptions{Variables: map[string]any{
-			"content": content,
-		}})
-	require.NoError(t, err)
-
-	secretID := secretRes.Directory.WithNewFile.File.Secret.ID
-	require.NotEmpty(t, secretID)
-
-	return secretID
-}
-
-func newFile(t *testing.T, path, contents string) core.FileID {
+func newFile(t *testctx.T, path, contents string) core.FileID {
 	var secretRes struct {
 		Directory struct {
 			WithNewFile struct {
@@ -128,7 +132,7 @@ func newFile(t *testing.T, path, contents string) core.FileID {
 		}
 	}
 
-	err := testutil.Query(
+	err := testutil.Query(t,
 		`query Test($path: String!, $contents: String!) {
 			directory {
 				withNewFile(path: $path, contents: $contents) {
@@ -175,7 +179,7 @@ func ls(dir string) ([]string, error) {
 	return names, nil
 }
 
-func tarEntries(t *testing.T, path string) []string {
+func tarEntries(t testing.TB, path string) []string {
 	f, err := os.Open(path)
 	require.NoError(t, err)
 
@@ -196,7 +200,7 @@ func tarEntries(t *testing.T, path string) []string {
 	return entries
 }
 
-func readTarFile(t *testing.T, pathToTar, pathInTar string) []byte {
+func readTarFile(t testing.TB, pathToTar, pathInTar string) []byte {
 	f, err := os.Open(pathToTar)
 	require.NoError(t, err)
 
@@ -220,19 +224,13 @@ func readTarFile(t *testing.T, pathToTar, pathInTar string) []byte {
 	return nil
 }
 
-func checkNotDisabled(t *testing.T, env string) { //nolint:unparam
-	if os.Getenv(env) == "0" {
-		t.Skipf("disabled via %s=0", env)
-	}
-}
-
 func computeMD5FromReader(reader io.Reader) string {
 	h := md5.New()
 	io.Copy(h, reader)
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-func daggerCliPath(t *testing.T) string {
+func daggerCliPath(t testing.TB) string {
 	t.Helper()
 	cliPath := os.Getenv("_EXPERIMENTAL_DAGGER_CLI_BIN")
 	if cliPath == "" {
@@ -247,164 +245,138 @@ func daggerCliPath(t *testing.T) string {
 	return cliPath
 }
 
-func daggerCliFile(t *testing.T, c *dagger.Client) *dagger.File {
-	t.Helper()
-	return c.Host().File(daggerCliPath(t))
+func daggerLinuxCliPath(t testing.TB) string {
+	if runtime.GOOS == "linux" {
+		return daggerCliPath(t)
+	}
+	cliPath := os.Getenv("_TEST_DAGGER_CLI_LINUX_BIN")
+	if cliPath == "" {
+		t.Log("missing _TEST_DAGGER_CLI_LINUX_BIN")
+		t.FailNow()
+	}
+	return cliPath
 }
 
-func lastNLines(str string, n int) string {
-	lines := strings.Split(strings.TrimSpace(str), "\n")
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
-	}
-	return strings.Join(lines, "\n")
+func daggerCliFile(t testing.TB, c *dagger.Client) *dagger.File {
+	// This loads the dagger-cli binary from the host into the container, that
+	// was set up by the test caller. This is used to communicate with the dev
+	// engine.
+	t.Helper()
+	return c.Host().File(daggerLinuxCliPath(t))
+}
+
+func daggerCliBase(t testing.TB, c *dagger.Client) *dagger.Container {
+	t.Helper()
+	return c.Container().From(golangImage).
+		WithMountedFile(testCLIBinPath, daggerCliFile(t, c)).
+		WithWorkdir("/work")
 }
 
 const testCLIBinPath = "/bin/dagger"
 
-func CLITestContainer(ctx context.Context, t *testing.T, c *dagger.Client) *DaggerCLIContainer {
-	t.Helper()
-	ctr := c.Container().From("alpine:3.16.2").
-		WithMountedFile(testCLIBinPath, daggerCliFile(t, c)).
-		WithEnvVariable("_EXPERIMENTAL_DAGGER_CLI_BIN", testCLIBinPath).
-		// TODO: this shouldn't be needed, dagger cli should pick up existing nestedness
-		WithEnvVariable("_EXPERIMENTAL_DAGGER_RUNNER_HOST", "unix:///.runner.sock")
-
-	return &DaggerCLIContainer{
-		Container: ctr,
-		ctx:       ctx,
-		t:         t,
-		c:         c,
+func goCache(c *dagger.Client) dagger.WithContainerFunc {
+	return func(ctr *dagger.Container) *dagger.Container {
+		return ctr.
+			WithMountedCache("/go/pkg/mod", c.CacheVolume("go-mod")).
+			WithEnvVariable("GOMODCACHE", "/go/pkg/mod").
+			WithMountedCache("/go/build-cache", c.CacheVolume("go-build")).
+			WithEnvVariable("GOCACHE", "/go/build-cache")
 	}
 }
 
-type DaggerCLIContainer struct {
-	*dagger.Container
-	ctx context.Context
-	t   *testing.T
-	c   *dagger.Client
-
-	// common
-	ProjectArg string
-
-	// "do"
-	OutputArg string
-	TargetArg string
-	UserArgs  map[string]string
-
-	// "project init"
-	SDKArg  string
-	NameArg string
-	RootArg string
+type safeBuffer struct {
+	bu bytes.Buffer
+	mu sync.Mutex
 }
 
-const cliContainerRepoMntPath = "/src"
+func (s *safeBuffer) Write(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bu.Write(p)
+}
 
-func (ctr DaggerCLIContainer) WithLoadedProject(
-	projectPath string,
-	convertToGitProject bool,
-) *DaggerCLIContainer {
-	ctr.t.Helper()
-	thisRepoPath, err := filepath.Abs("../..")
-	require.NoError(ctr.t, err)
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bu.String()
+}
 
-	thisRepoDir := ctr.c.Host().Directory(thisRepoPath, dagger.HostDirectoryOpts{
-		Exclude: []string{".git", "bin", "docs", "website"},
-	})
-	projectArg := filepath.Join(cliContainerRepoMntPath, projectPath)
-
-	baseCtr := ctr.Container
-	if convertToGitProject {
-		gitSvc, _ := gitService(ctr.ctx, ctr.t, ctr.c, thisRepoDir)
-		baseCtr = baseCtr.WithServiceBinding("git", gitSvc)
-
-		endpoint, err := gitSvc.Endpoint(ctr.ctx)
-		require.NoError(ctr.t, err)
-		projectArg = "git://" + endpoint + "/repo.git" + "?ref=main&protocol=git"
-		if projectPath != "" {
-			projectArg += "&subpath=" + projectPath
+func limitTicker(interval time.Duration, limit int) <-chan time.Time {
+	ch := make(chan time.Time, limit)
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		defer close(ch)
+		for i := 0; i < limit; i++ {
+			ch <- <-ticker.C
 		}
-	} else {
-		baseCtr = baseCtr.WithMountedDirectory(cliContainerRepoMntPath, thisRepoDir)
-	}
-
-	ctr.Container = baseCtr
-	ctr.ProjectArg = projectArg
-	return &ctr
+	}()
+	return ch
 }
 
-func (ctr DaggerCLIContainer) WithProjectArg(projectArg string) *DaggerCLIContainer {
-	ctr.ProjectArg = projectArg
-	return &ctr
+// ensure the cache mount doesn't get pruned in the middle of the test by having a container
+// run throughout with the cache mounted
+func preventCacheMountPrune(ctx context.Context, t *testctx.T, c *dagger.Client, cache *dagger.CacheVolume, opts ...dagger.ContainerWithMountedCacheOpts) func() error {
+	t.Helper()
+	ctx, cancel := context.WithCancelCause(ctx)
+	cancelErr := errors.New("test done")
+	t.Cleanup(func() {
+		cancel(cancelErr)
+	})
+	defer cancel(cancelErr)
+	var eg errgroup.Group
+	eg.Go(func() error {
+		_, err := c.Container().
+			From(alpineImage).
+			WithMountedCache("/cache", cache, opts...).
+			WithExec([]string{"sh", "-c", "sleep 9999"}).
+			Sync(ctx)
+		if errors.Is(err, cancelErr) {
+			return nil
+		}
+		return err
+	})
+
+	return func() error {
+		cancel(cancelErr)
+		return eg.Wait()
+	}
 }
 
-func (ctr DaggerCLIContainer) WithOutputArg(outputArg string) *DaggerCLIContainer {
-	ctr.OutputArg = outputArg
-	return &ctr
+// requireErrOut is the same as require.ErrorContains, except it also looks in
+// the Stdout/Stderr of a *dagger.ExecErr, since that's something we do a lot
+// in tests.
+//
+// TODO: A better alternative might be to record the log output and assert
+// against what the user sees there, but that's a bigger lift.
+func requireErrOut(t *testctx.T, err error, out string) {
+	var execErr *dagger.ExecError
+	if errors.As(err, &execErr) {
+		require.Contains(
+			t,
+			fmt.Sprintf("%s\nStdout: %s\nStderr: %s", err, execErr.Stdout, execErr.Stderr),
+			out,
+		)
+		return
+	}
+	require.ErrorContains(t, err, out)
 }
 
-func (ctr DaggerCLIContainer) WithTarget(target string) *DaggerCLIContainer {
-	ctr.TargetArg = target
-	return &ctr
-}
-
-func (ctr DaggerCLIContainer) WithUserArg(key, value string) *DaggerCLIContainer {
-	if ctr.UserArgs == nil {
-		ctr.UserArgs = map[string]string{}
+// requireErrRegexp is the same as require.Regexp against err.Error(), except
+// it also looks in the Stdout/Stderr of a *dagger.ExecErr, since that's
+// something we do a lot in tests.
+//
+// TODO: A better alternative might be to record the log output and assert
+// against what the user sees there, but that's a bigger lift.
+func requireErrRegexp(t *testctx.T, err error, re string) {
+	var execErr *dagger.ExecError
+	if errors.As(err, &execErr) {
+		require.Regexp(
+			t,
+			re,
+			fmt.Sprintf("%s\nStdout: %s\nStderr: %s", err, execErr.Stdout, execErr.Stderr),
+		)
+		return
 	}
-	ctr.UserArgs[key] = value
-	return &ctr
-}
-
-func (ctr DaggerCLIContainer) WithSDKArg(sdk string) *DaggerCLIContainer {
-	ctr.SDKArg = sdk
-	return &ctr
-}
-
-func (ctr DaggerCLIContainer) WithNameArg(name string) *DaggerCLIContainer {
-	ctr.NameArg = name
-	return &ctr
-}
-
-func (ctr DaggerCLIContainer) CallDo() *DaggerCLIContainer {
-	args := []string{testCLIBinPath, "do"}
-	if ctr.ProjectArg != "" {
-		args = append(args, "--project", ctr.ProjectArg)
-	}
-	if ctr.OutputArg != "" {
-		args = append(args, "--output", ctr.OutputArg)
-	}
-	args = append(args, ctr.TargetArg)
-	for k, v := range ctr.UserArgs {
-		args = append(args, "--"+k, v)
-	}
-	ctr.Container = ctr.Container.WithExec(args, dagger.ContainerWithExecOpts{ExperimentalPrivilegedNesting: true})
-	return &ctr
-}
-
-func (ctr DaggerCLIContainer) CallProject() *DaggerCLIContainer {
-	args := []string{testCLIBinPath, "--silent", "project"}
-	if ctr.ProjectArg != "" {
-		args = append(args, "--project", ctr.ProjectArg)
-	}
-	ctr.Container = ctr.WithExec(args, dagger.ContainerWithExecOpts{ExperimentalPrivilegedNesting: true})
-	return &ctr
-}
-
-func (ctr DaggerCLIContainer) CallProjectInit() *DaggerCLIContainer {
-	args := []string{testCLIBinPath, "--silent", "project", "init"}
-	if ctr.ProjectArg != "" {
-		args = append(args, "--project", ctr.ProjectArg)
-	}
-	if ctr.SDKArg != "" {
-		args = append(args, "--sdk", ctr.SDKArg)
-	}
-	if ctr.NameArg != "" {
-		args = append(args, "--name", ctr.NameArg)
-	}
-	if ctr.RootArg != "" {
-		args = append(args, "--root", ctr.RootArg)
-	}
-	ctr.Container = ctr.WithExec(args, dagger.ContainerWithExecOpts{ExperimentalPrivilegedNesting: true})
-	return &ctr
+	require.Regexp(t, re, err.Error())
 }

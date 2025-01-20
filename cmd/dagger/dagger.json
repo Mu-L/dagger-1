@@ -1,0 +1,16 @@
+{
+  "name": "dagger-cli",
+  "engineVersion": "v0.13.7",
+  "sdk": "go",
+  "dependencies": [
+    {
+      "name": "go",
+      "source": "../../modules/go"
+    },
+    {
+      "name": "version",
+      "source": "../../version"
+    }
+  ],
+  "source": ".dagger"
+}
